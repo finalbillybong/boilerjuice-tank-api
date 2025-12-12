@@ -3,11 +3,11 @@ Module provides a JSON API for querying information from BoilerJuice website
 """
 from os import environ
 import sys
-import re
 import requests
 from lxml import html
 from flask import Response, Flask
 from prometheus_client import Gauge, Enum, generate_latest
+import re
 
 # Import variables from environment
 if environ.get('BJ_USERNAME') != "username":
@@ -44,21 +44,30 @@ oil_level_name = Enum(
     'oil_level_name', 'BoilerJuice tank level name', ['email'], states=['High', 'Medium', 'Low'])
 
 
+def extract_number(text):
+    """
+    Extracts the first float-like number from a string using regex.
+    Returns None if no number is found.
+    """
+    if not text:
+        return None
+    match = re.findall(r"(\d+(?:\.\d+)?)", text.replace(",", ""))
+    return float(match[0]) if match else None
+
+
 def login():
     """
     Logs into BoilerJuice website and populates the session key
     """
     try:
-        # Create a session, and use for all future requests
         session = requests.session()
 
-        # Get login csrf token
         result = session.get(LOGIN_URL)
         tree = html.fromstring(result.text)
         authenticity_token = list(
-            set(tree.xpath("//input[@name='authenticity_token']/@value")))[0]
+            set(tree.xpath("//input[@name='authenticity_token']/@value"))
+        )[0]
 
-        # Create payload
         payload = {
             "user[email]": USERNAME,
             "user[password]": PASSWORD,
@@ -66,9 +75,9 @@ def login():
             "commit": "Log in"
         }
 
-        # Perform login
         result = session.post(
-            LOGIN_URL, data=payload, headers=dict(referer=LOGIN_URL))
+            LOGIN_URL, data=payload, headers=dict(referer=LOGIN_URL)
+        )
 
         if 'jwt' in session.cookies:
             print("Login successful")
@@ -84,19 +93,17 @@ def login():
 
 
 SESH = None
-
 app = Flask(__name__)
 
 
 @app.route('/', methods=['GET'])
 def main():
     """
-    Retrieves tank information and builds
-    a JSON object for API return
+    Retrieves tank information and builds a JSON object for API return
     """
     try:
         global SESH
-        # Scrape url
+
         if SESH is None or 'jwt' not in SESH.cookies:
             SESH = login()
 
@@ -104,54 +111,50 @@ def main():
             result = SESH.get(URL + TANK + '/edit', headers=dict(referer=URL))
 
             tree = html.fromstring(result.content)
-            tank_level = tree.xpath(
-                "//div[contains(@id, 'usable-oil')]/div/p/text()")
-            tank_total_level = tree.xpath(
-                "//div[contains(@id, 'total-oil')]/div/p/text()")
-            tank_capacity = tree.xpath(
-                "//input[@title='tank-size-count']/@value")
-            tank_level_name = tree.xpath(
-                "//div[@class='bar-container']/div[@class='status']/p/text()")
-            tank_percentage = tree.xpath(
-                "//div[contains(@id, 'usable-oil')]//div/@data-percentage")
-            tank_total_percentage = tree.xpath(
-                "//div[contains(@id, 'total-oil')]//div/@data-percentage"
-            )
 
-            # Create object to store scraped data in
+            tank_level = tree.xpath("//div[contains(@id, 'usable-oil')]/div/p/text()")
+            tank_total_level = tree.xpath("//div[contains(@id, 'total-oil')]/div/p/text()")
+            tank_capacity = tree.xpath("//input[@title='tank-size-count']/@value")
+            tank_level_name = tree.xpath("//div[@class='bar-container']/div[@class='status']/p/text()")
+            tank_percentage = tree.xpath("//div[contains(@id, 'usable-oil')]//div/@data-percentage")
+            tank_total_percentage = tree.xpath("//div[contains(@id, 'total-oil')]//div/@data-percentage")
+
             bj_data = {}
 
-            # --- Fixed parsing for usable oil level ---
+            # Extract usable level
             for level in tank_level:
-                if "litres" in level:
-                    match = re.search(r"(\d+(?:\.\d+)?)", level)
-                    if match:
-                        bj_data["level"] = float(match.group(1))
+                num = extract_number(level)
+                if num is not None:
+                    bj_data["level"] = num
+                    break
 
-            # --- Fixed parsing for total oil level ---
+            # Extract total level
             for level in tank_total_level:
-                if "litres" in level:
-                    match = re.search(r"(\d+(?:\.\d+)?)", level)
-                    if match:
-                        bj_data["total_level"] = float(match.group(1))
+                num = extract_number(level)
+                if num is not None:
+                    bj_data["total_level"] = num
+                    break
 
-            # Percentages and capacity
-            bj_data["percent"] = float(tank_percentage[0]) if tank_percentage else 0.0
-            bj_data["total_percent"] = float(tank_total_percentage[0]) if tank_total_percentage else 0.0
+            if "level" not in bj_data:
+                raise ValueError(f"Could not parse usable oil level: {tank_level}")
 
-            # Populate data object
+            if "total_level" not in bj_data:
+                raise ValueError(f"Could not parse total oil level: {tank_total_level}")
+
+            bj_data["percent"] = float(tank_percentage[0])
+            bj_data["total_percent"] = float(tank_total_percentage[0])
+
             data = {
-                "litres": bj_data.get("level", 0.0),
-                "total_litres": bj_data.get("total_level", 0.0),
-                "percent": bj_data.get("percent", 0.0),
-                "total_percent": bj_data.get("total_percent", 0.0),
-                "capacity": float(tank_capacity[0]) if tank_capacity else 0.0
+                "litres": bj_data["level"],
+                "total_litres": bj_data["total_level"],
+                "percent": bj_data["percent"],
+                "total_percent": bj_data["total_percent"],
+                "capacity": float(tank_capacity[0])
             }
 
             if tank_level_name:
                 data["level_name"] = tank_level_name[0]
 
-            # Return API result
             return data
 
     except Exception as err:
@@ -165,20 +168,15 @@ def metrics():
     Prometheus metric endpoint build and export
     """
     try:
-        # Pull back latest metrics from API
         bj_data = main()
 
-        # Populate Prometheus Gauge objects with new data
         oil_level_litres.labels(email=USERNAME).set(bj_data["litres"])
         oil_level_total_litres.labels(email=USERNAME).set(bj_data["total_litres"])
         oil_level_percent.labels(email=USERNAME).set(bj_data["percent"])
         oil_level_total_percent.labels(email=USERNAME).set(bj_data["total_percent"])
         oil_level_capacity.labels(email=USERNAME).set(bj_data["capacity"])
+        oil_level_name.labels(email=USERNAME).state(bj_data["level_name"])
 
-        if "level_name" in bj_data:
-            oil_level_name.labels(email=USERNAME).state(bj_data["level_name"])
-
-        # Return Prometheus metrics
         return Response(generate_latest(), mimetype="text/plain")
 
     except Exception as err:
